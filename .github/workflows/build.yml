@@ -1,40 +1,124 @@
 name: Build
-
 on:
   push:
-    branches:
-      - master
-  workflow_dispatch:
-
+    branches: [master]
+    paths-ignore: [README.md]
+  release:
+    types: [published]
+defaults:
+  run:
+    shell: bash
+    working-directory: src
+env:
+  CACHE_EPOCH: 1
+  CCACHE_MAXSIZE: 200M
+  CCACHE_MAXFILES: 0
+  SCCACHE_CACHE_SIZE: 200M
 jobs:
   cache-toolchains-posix:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - name: Cache toolchains (Linux, OpenWrt, Android)
+        uses: actions/cache@v4
         with:
           path: |
             src/third_party/llvm-build/Release+Asserts/
             src/gn/
             src/qemu-user*.deb
-          key: toolchains-posix-${{ hashFiles('CHROMIUM_VERSION') }}
-      - run: sudo apt update && sudo apt install ninja-build pkg-config ccache
+          key: toolchains-posix-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - name: Cache PGO (Linux, OpenWrt)
+        uses: actions/cache@v4
+        with:
+          path: src/chrome/build/pgo_profiles/
+          key: pgo-linux-openwrt-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - name: Cache AFDO (Android)
+        uses: actions/cache@v4
+        with:
+          path: src/chrome/android/profiles/
+          key: afdo-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - name: Cache Android NDK (Android)
+        uses: actions/cache@v4
+        with:
+          path: src/third_party/android_toolchain/ndk/
+          key: android-ndk-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
       - run: ./get-clang.sh
-
+      - run: EXTRA_FLAGS='target_os="android"' ./get-clang.sh
+      - run: |
+          if [ ! -f qemu-user*.deb ]; then
+            wget https://snapshot.debian.org/archive/debian/20250405T083429Z/pool/main/q/qemu/qemu-user_9.2.2%2Bds-1%2Bb2_amd64.deb
+          fi
   openwrt:
     needs: cache-toolchains-posix
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64_cortex-a53-static
+            openwrt: "target=sunxi subtarget=cortexa53"
+            target_cpu: arm64
+            extra: 'arm_cpu="cortex-a53" build_static=true use_allocator_shim=false use_partition_alloc=false'
+            openwrt_release: '24.10.0'
+            openwrt_gcc_ver: '13.3.0'
     env:
-      EXTRA_FLAGS: target_cpu="arm64" target_os="openwrt" arm_cpu="cortex-a53" build_static=true use_allocator_shim=false use_partition_alloc=false chrome_pgo_phase=0
-      OPENWRT_FLAGS: arch=aarch64_cortex-a53-static target=sunxi subtarget=cortexa53 release=24.10.0 gcc_ver=13.3.0
+      EXTRA_FLAGS: target_cpu="${{ matrix.target_cpu }}" target_os="openwrt" ${{ matrix.extra }}
+      OPENWRT_FLAGS: arch=${{ matrix.arch }} release=${{ matrix.openwrt_release || '18.06.0' }} gcc_ver=${{ matrix.openwrt_gcc_ver || '7.3.0' }} ${{ matrix.openwrt }}
+      BUNDLE: naiveproxy-${{ github.event.release.tag_name }}-${{ github.job }}-${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - name: Cache toolchains (Linux, OpenWrt, Android)
+        uses: actions/cache@v4
         with:
-          path: src/third_party/llvm-build/Release+Asserts/
-          key: toolchains-posix-${{ hashFiles('CHROMIUM_VERSION') }}
-
-      - run: sudo apt update && sudo apt install ninja-build pkg-config ccache bubblewrap
+          path: |
+            src/third_party/llvm-build/Release+Asserts/
+            src/gn/
+            src/qemu-user*.deb
+          key: toolchains-posix-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - name: Cache PGO (Linux, OpenWrt)
+        uses: actions/cache@v4
+        with:
+          path: src/chrome/build/pgo_profiles/
+          key: pgo-linux-openwrt-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - name: Cache sysroot
+        uses: actions/cache@v4
+        with:
+          path: src/out/sysroot-build/openwrt
+          key: sysroot-openwrt-23.05.0-${{ matrix.arch }}-v${{ env.CACHE_EPOCH }}
+      - id: ccache-timestamp
+        run: echo "CCACHE_TIMESTAMP=$(date +%s)" >>$GITHUB_OUTPUT
+      - name: Cache ccache files
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-openwrt-${{ matrix.arch }}-${{ hashFiles('CHROMIUM_VERSION') }}-${{ steps.ccache-timestamp.outputs.CCACHE_TIMESTAMP }}
+          restore-keys: ccache-openwrt-${{ matrix.arch }}-${{ hashFiles('CHROMIUM_VERSION') }}-
+      - name: Install APT packages
+        run: |
+          sudo apt update
+          sudo apt install ninja-build pkg-config ccache bubblewrap
+          sudo apt remove -y qemu-user-binfmt
+          sudo dpkg -i qemu-user*.deb
+          # libc6-i386 interferes with x86 build
+          sudo apt remove libc6-i386
       - run: ./get-clang.sh
       - run: ccache -z
       - run: ./build.sh
+      - run: ccache -s && ccache --evict-older-than 1d
+      - run: ../tests/basic.sh out/Release/naive
+      - name: Pack naiveproxy assets
+        run: |
+          mkdir ${{ env.BUNDLE }}
+          cp out/Release/naive config.json ../LICENSE ../USAGE.txt ${{ env.BUNDLE }}
+          tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
+          openssl sha256 out/Release/naive >sha256sum.txt
+          echo "SHA256SUM=$(cut -d' ' -f2 sha256sum.txt)" >>$GITHUB_ENV
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUNDLE }}.tar.xz naive executable sha256 ${{ env.SHA256SUM }}
+          path: src/sha256sum.txt
+      - name: Upload naiveproxy assets
+        if: ${{ github.event_name == 'release' }}
+        run: gh release upload "${GITHUB_REF##*/}" ${{ env.BUNDLE }}.tar.xz --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
