@@ -10,6 +10,8 @@
 #include "net/tools/naive/naive_connection.h"
 
 #include <cstring>
+#include <limits>
+#include <string_view>
 #include <utility>
 
 #include "base/functional/bind.h"
@@ -45,11 +47,127 @@
 #include "net/base/sockaddr_storage.h"
 #include "net/socket/tcp_client_socket.h"
 #endif
+#include "net/socket/udp_server_socket.h"
 
 namespace net {
 
 namespace {
 constexpr int kBufferSize = 64 * 1024;
+constexpr size_t kSocksUdpHeaderMinSize = 4;
+constexpr uint8_t kSocksAddressIPv4 = 0x01;
+constexpr uint8_t kSocksAddressDomain = 0x03;
+constexpr uint8_t kSocksAddressIPv6 = 0x04;
+constexpr uint8_t kUotAddressIPv4 = 0x00;
+constexpr uint8_t kUotAddressIPv6 = 0x01;
+constexpr uint8_t kUotAddressDomain = 0x02;
+
+void AppendUint16(std::string* out, uint16_t value) {
+  out->push_back(static_cast<char>((value >> 8) & 0xff));
+  out->push_back(static_cast<char>(value & 0xff));
+}
+
+bool ReadUint16(std::string_view in, size_t offset, uint16_t* value) {
+  if (offset + 2 > in.size()) {
+    return false;
+  }
+  *value = (static_cast<uint8_t>(in[offset]) << 8) |
+           static_cast<uint8_t>(in[offset + 1]);
+  return true;
+}
+
+bool EncodeSocksUdpToUotFrame(std::string_view packet, std::string* frame) {
+  if (packet.size() < kSocksUdpHeaderMinSize || packet[0] != 0 ||
+      packet[1] != 0 || packet[2] != 0) {
+    return false;
+  }
+  size_t offset = 3;
+  uint8_t atyp = static_cast<uint8_t>(packet[offset++]);
+  frame->clear();
+  if (atyp == kSocksAddressIPv4) {
+    if (offset + 4 + 2 > packet.size()) {
+      return false;
+    }
+    frame->push_back(static_cast<char>(kUotAddressIPv4));
+    frame->append(packet.substr(offset, 4));
+    offset += 4;
+  } else if (atyp == kSocksAddressIPv6) {
+    if (offset + 16 + 2 > packet.size()) {
+      return false;
+    }
+    frame->push_back(static_cast<char>(kUotAddressIPv6));
+    frame->append(packet.substr(offset, 16));
+    offset += 16;
+  } else if (atyp == kSocksAddressDomain) {
+    if (offset >= packet.size()) {
+      return false;
+    }
+    size_t domain_len = static_cast<uint8_t>(packet[offset]);
+    if (offset + 1 + domain_len + 2 > packet.size()) {
+      return false;
+    }
+    frame->push_back(static_cast<char>(kUotAddressDomain));
+    frame->append(packet.substr(offset, 1 + domain_len));
+    offset += 1 + domain_len;
+  } else {
+    return false;
+  }
+  frame->append(packet.substr(offset, 2));
+  offset += 2;
+  size_t payload_len = packet.size() - offset;
+  if (payload_len > std::numeric_limits<uint16_t>::max()) {
+    return false;
+  }
+  AppendUint16(frame, static_cast<uint16_t>(payload_len));
+  frame->append(packet.substr(offset));
+  return true;
+}
+
+bool EncodeUotFrameToSocksUdp(std::string_view address,
+                              std::string_view payload,
+                              std::string* packet) {
+  if (address.empty()) {
+    return false;
+  }
+  packet->clear();
+  packet->append("\x00\x00\x00", 3);
+  uint8_t atyp = static_cast<uint8_t>(address[0]);
+  if (atyp == kUotAddressIPv4) {
+    if (address.size() != 1 + 4 + 2) {
+      return false;
+    }
+    packet->push_back(static_cast<char>(kSocksAddressIPv4));
+    packet->append(address.substr(1));
+  } else if (atyp == kUotAddressIPv6) {
+    if (address.size() != 1 + 16 + 2) {
+      return false;
+    }
+    packet->push_back(static_cast<char>(kSocksAddressIPv6));
+    packet->append(address.substr(1));
+  } else if (atyp == kUotAddressDomain) {
+    if (address.size() < 2) {
+      return false;
+    }
+    size_t domain_len = static_cast<uint8_t>(address[1]);
+    if (address.size() != 1 + 1 + domain_len + 2) {
+      return false;
+    }
+    packet->push_back(static_cast<char>(kSocksAddressDomain));
+    packet->append(address.substr(1));
+  } else {
+    return false;
+  }
+  packet->append(payload);
+  return true;
+}
+
+std::string EncodeUotAssociateRequest() {
+  std::string request;
+  request.push_back('\x00');  // IsConnect=false.
+  request.push_back('\x01');  // SOCKS serializer IPv4 address family.
+  request.append("\x00\x00\x00\x00", 4);
+  request.append("\x00\x00", 2);
+  return request;
+}
 }  // namespace
 
 NaiveConnection::NaiveConnection(
@@ -111,6 +229,10 @@ int NaiveConnection::Connect(CompletionOnceCallback callback) {
 
 void NaiveConnection::Disconnect() {
   full_duplex_ = false;
+  if (udp_socket_) {
+    udp_socket_->Close();
+    udp_socket_.reset();
+  }
   // Closes server side first because latency is higher.
   if (server_socket_handle_->socket()) {
     server_socket_handle_->socket()->Disconnect();
@@ -296,6 +418,17 @@ int NaiveConnection::DoConnectServerComplete(int result) {
   sockets_[kServer] = std::make_unique<NaivePaddingSocket>(
       server_socket_handle_->socket(), *server_padding_type, kServer);
 
+  if (protocol_ == ClientProtocol::kSocks5) {
+    auto* socket = static_cast<Socks5ServerSocket*>(client_socket_.get());
+    if (socket->is_udp_associate()) {
+      udp_socket_ = socket->TakeUdpSocket();
+      if (!udp_socket_) {
+        return ERR_SOCKS_CONNECTION_FAILED;
+      }
+      udp_mode_ = true;
+    }
+  }
+
   full_duplex_ = true;
   next_state_ = STATE_NONE;
   return OK;
@@ -305,6 +438,10 @@ int NaiveConnection::Run(CompletionOnceCallback callback) {
   DCHECK(sockets_[kServer]);
   DCHECK_EQ(next_state_, STATE_NONE);
   DCHECK(!connect_callback_);
+
+  if (udp_mode_) {
+    return RunUdpAssociate(std::move(callback));
+  }
 
   // The client-side socket may be closed before the server-side
   // socket is connected.
@@ -484,6 +621,231 @@ void NaiveConnection::OnPushComplete(Direction from, Direction to, int result) {
                                   weak_ptr_factory_.GetWeakPtr(), from, to));
   } else {
     Pull(from, to);
+  }
+}
+
+int NaiveConnection::RunUdpAssociate(CompletionOnceCallback callback) {
+  DCHECK(udp_socket_);
+  DCHECK(sockets_[kServer]);
+  run_callback_ = std::move(callback);
+  QueueServerWrite(EncodeUotAssociateRequest());
+  StartUdpRecv();
+  uot_read_state_ = 0;
+  uot_next_read_size_ = 1;
+  StartUotRead(uot_next_read_size_);
+  return ERR_IO_PENDING;
+}
+
+void NaiveConnection::StartUdpRecv() {
+  if (!udp_socket_ || errors_[kClient] < 0 || errors_[kServer] < 0) {
+    return;
+  }
+  udp_read_buffer_ = base::MakeRefCounted<IOBufferWithSize>(kBufferSize);
+  udp_recv_endpoint_ = std::make_unique<IPEndPoint>();
+  int rv = udp_socket_->RecvFrom(
+      udp_read_buffer_.get(), kBufferSize, udp_recv_endpoint_.get(),
+      base::BindOnce(&NaiveConnection::OnUdpRecvComplete,
+                     weak_ptr_factory_.GetWeakPtr()));
+  if (rv != ERR_IO_PENDING) {
+    OnUdpRecvComplete(rv);
+  }
+}
+
+void NaiveConnection::OnUdpRecvComplete(int result) {
+  if (result <= 0) {
+    FinishRun(result < 0 ? result : ERR_CONNECTION_CLOSED);
+    return;
+  }
+  if (!udp_client_endpoint_) {
+    udp_client_endpoint_ = std::move(udp_recv_endpoint_);
+  } else if (!(*udp_client_endpoint_ == *udp_recv_endpoint_)) {
+    StartUdpRecv();
+    return;
+  }
+
+  std::string frame;
+  std::string_view packet(udp_read_buffer_->data(), result);
+  if (EncodeSocksUdpToUotFrame(packet, &frame)) {
+    QueueServerWrite(std::move(frame));
+  }
+  StartUdpRecv();
+}
+
+void NaiveConnection::OnUdpFrameWritten(int result) {
+  udp_send_pending_ = false;
+  udp_send_buffer_ = nullptr;
+  if (result < 0) {
+    FinishRun(result);
+    return;
+  }
+  ProcessUotReadBuffer();
+}
+
+void NaiveConnection::StartUotRead(size_t size) {
+  if (!sockets_[kServer] || errors_[kServer] < 0) {
+    return;
+  }
+  read_buffers_[kServer] = base::MakeRefCounted<IOBufferWithSize>(size);
+  int rv = sockets_[kServer]->Read(
+      read_buffers_[kServer].get(), size,
+      base::BindOnce(&NaiveConnection::OnUotReadComplete,
+                     weak_ptr_factory_.GetWeakPtr()));
+  if (rv != ERR_IO_PENDING) {
+    OnUotReadComplete(rv);
+  }
+}
+
+void NaiveConnection::OnUotReadComplete(int result) {
+  if (result <= 0) {
+    FinishRun(result < 0 ? result : ERR_CONNECTION_CLOSED);
+    return;
+  }
+  uot_read_buffer_.append(read_buffers_[kServer]->data(), result);
+  ProcessUotReadBuffer();
+}
+
+void NaiveConnection::ProcessUotReadBuffer() {
+  while (uot_read_buffer_.size() >= uot_next_read_size_) {
+    if (uot_read_state_ == 0) {
+      uint8_t atyp = static_cast<uint8_t>(uot_read_buffer_[0]);
+      size_t address_len = 0;
+      if (atyp == kUotAddressIPv4) {
+        address_len = 1 + 4 + 2;
+      } else if (atyp == kUotAddressIPv6) {
+        address_len = 1 + 16 + 2;
+      } else if (atyp == kUotAddressDomain) {
+        uot_read_state_ = 1;
+        uot_next_read_size_ = 2;
+        continue;
+      } else {
+        FinishRun(ERR_INVALID_RESPONSE);
+        return;
+      }
+      uot_read_state_ = 2;
+      uot_next_read_size_ = address_len;
+      continue;
+    }
+    if (uot_read_state_ == 1) {
+      size_t domain_len = static_cast<uint8_t>(uot_read_buffer_[1]);
+      uot_read_state_ = 2;
+      uot_next_read_size_ = 1 + 1 + domain_len + 2;
+      continue;
+    }
+    if (uot_read_state_ == 2) {
+      uot_frame_address_ = uot_read_buffer_.substr(0, uot_next_read_size_);
+      uot_read_buffer_.erase(0, uot_next_read_size_);
+      uot_read_state_ = 3;
+      uot_next_read_size_ = 2;
+      continue;
+    }
+    if (uot_read_state_ == 3) {
+      uint16_t payload_len = 0;
+      if (!ReadUint16(uot_read_buffer_, 0, &payload_len)) {
+        FinishRun(ERR_INVALID_RESPONSE);
+        return;
+      }
+      uot_read_buffer_.erase(0, 2);
+      uot_read_state_ = 4;
+      uot_next_read_size_ = payload_len;
+      continue;
+    }
+    DCHECK_EQ(uot_read_state_, 4);
+    std::string payload = uot_read_buffer_.substr(0, uot_next_read_size_);
+    uot_read_buffer_.erase(0, uot_next_read_size_);
+    if (udp_socket_ && udp_client_endpoint_) {
+      std::string packet;
+      if (EncodeUotFrameToSocksUdp(uot_frame_address_, payload, &packet)) {
+        uot_frame_address_.clear();
+        uot_read_state_ = 0;
+        uot_next_read_size_ = 1;
+        udp_send_buffer_ = base::MakeRefCounted<StringIOBuffer>(packet);
+        int rv = udp_socket_->SendTo(
+            udp_send_buffer_.get(), packet.size(), *udp_client_endpoint_,
+            base::BindOnce(&NaiveConnection::OnUdpFrameWritten,
+                           weak_ptr_factory_.GetWeakPtr()));
+        if (rv == ERR_IO_PENDING) {
+          udp_send_pending_ = true;
+          return;
+        }
+        udp_send_buffer_ = nullptr;
+        if (rv < 0) {
+          FinishRun(rv);
+          return;
+        }
+      }
+    }
+    if (uot_read_state_ == 4) {
+      uot_frame_address_.clear();
+      uot_read_state_ = 0;
+      uot_next_read_size_ = 1;
+    }
+  }
+  if (!udp_send_pending_) {
+    StartUotRead(uot_next_read_size_ - uot_read_buffer_.size());
+  }
+}
+
+void NaiveConnection::QueueServerWrite(std::string data) {
+  server_write_queue_.push(std::move(data));
+  StartServerWrite();
+}
+
+void NaiveConnection::StartServerWrite() {
+  if (server_write_pending_ || server_write_queue_.empty() ||
+      !sockets_[kServer]) {
+    return;
+  }
+  server_write_buffer_ = base::MakeRefCounted<DrainableIOBuffer>(
+      base::MakeRefCounted<StringIOBuffer>(server_write_queue_.front()),
+      server_write_queue_.front().size());
+  server_write_pending_ = true;
+  int rv = sockets_[kServer]->Write(
+      server_write_buffer_.get(), server_write_buffer_->BytesRemaining(),
+      base::BindOnce(&NaiveConnection::OnServerWriteComplete,
+                     weak_ptr_factory_.GetWeakPtr()),
+      traffic_annotation_);
+  if (rv != ERR_IO_PENDING) {
+    OnServerWriteComplete(rv);
+  }
+}
+
+void NaiveConnection::OnServerWriteComplete(int result) {
+  if (result < 0) {
+    FinishRun(result);
+    return;
+  }
+  server_write_buffer_->DidConsume(result);
+  if (server_write_buffer_->BytesRemaining() > 0) {
+    int rv = sockets_[kServer]->Write(
+        server_write_buffer_.get(), server_write_buffer_->BytesRemaining(),
+        base::BindOnce(&NaiveConnection::OnServerWriteComplete,
+                       weak_ptr_factory_.GetWeakPtr()),
+        traffic_annotation_);
+    if (rv != ERR_IO_PENDING) {
+      OnServerWriteComplete(rv);
+    }
+    return;
+  }
+  server_write_pending_ = false;
+  server_write_buffer_ = nullptr;
+  server_write_queue_.pop();
+  StartServerWrite();
+}
+
+void NaiveConnection::FinishRun(int result) {
+  if (errors_[kClient] < 0 || errors_[kServer] < 0) {
+    return;
+  }
+  errors_[kClient] = result;
+  errors_[kServer] = result;
+  if (udp_socket_) {
+    udp_socket_->Close();
+    udp_socket_.reset();
+  }
+  Disconnect(kServer);
+  client_socket_->Disconnect();
+  if (run_callback_) {
+    std::move(run_callback_).Run(result);
   }
 }
 
