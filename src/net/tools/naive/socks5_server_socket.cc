@@ -42,7 +42,9 @@ static constexpr char kSubnegotiationVersion = '\x01';
 static constexpr char kAuthStatusSuccess = '\x00';
 static constexpr char kAuthStatusFailure = '\xff';
 static constexpr char kReplySuccess = '\x00';
+static constexpr char kReplyGeneralFailure = '\x01';
 static constexpr char kReplyCommandNotSupported = '\x07';
+static constexpr char kUotMagicAddress[] = "sp.v2.udp-over-tcp.arpa";
 
 static_assert(sizeof(struct in_addr) == 4, "incorrect system size of IPv4");
 static_assert(sizeof(struct in6_addr) == 16, "incorrect system size of IPv6");
@@ -72,6 +74,14 @@ const HostPortPair& Socks5ServerSocket::request_endpoint() const {
   return request_endpoint_;
 }
 
+bool Socks5ServerSocket::is_udp_associate() const {
+  return is_udp_associate_;
+}
+
+std::unique_ptr<UDPServerSocket> Socks5ServerSocket::TakeUdpSocket() {
+  return std::move(udp_socket_);
+}
+
 int Socks5ServerSocket::Connect(CompletionOnceCallback callback) {
   DCHECK(transport_);
   DCHECK_EQ(STATE_NONE, next_state_);
@@ -98,11 +108,16 @@ int Socks5ServerSocket::Connect(CompletionOnceCallback callback) {
 
 void Socks5ServerSocket::Disconnect() {
   completed_handshake_ = false;
+  if (udp_socket_) {
+    udp_socket_->Close();
+    udp_socket_.reset();
+  }
   transport_->Disconnect();
 
   // Reset other states to make sure they aren't mistakenly used later.
   // These are the states initialized by Connect().
   next_state_ = STATE_NONE;
+  is_udp_associate_ = false;
   user_callback_.Reset();
 }
 
@@ -544,7 +559,10 @@ int Socks5ServerSocket::DoHandshakeReadComplete(int result) {
       // The proxy replies with success immediately without first connecting
       // to the requested endpoint.
       reply_ = kReplySuccess;
-    } else if (command == kCommandBind || command == kCommandUDPAssociate) {
+    } else if (command == kCommandUDPAssociate) {
+      reply_ = kReplySuccess;
+      is_udp_associate_ = true;
+    } else if (command == kCommandBind) {
       reply_ = kReplyCommandNotSupported;
     } else {
       net_log_.AddEventWithIntParams(NetLogEventType::SOCKS_UNEXPECTED_COMMAND,
@@ -591,7 +609,23 @@ int Socks5ServerSocket::DoHandshakeReadComplete(int result) {
     uint16_t port_host = base::NetToHost16(port_net);
 
     size_t address_start = port_start - address_size_;
-    if (address_type_ == kEndPointDomain) {
+    if (is_udp_associate_) {
+      request_endpoint_ = HostPortPair(kUotMagicAddress, 0);
+      udp_socket_ = std::make_unique<UDPServerSocket>(
+          net_log_.net_log(), net_log_.source());
+      int rv = udp_socket_->Listen(
+          IPEndPoint(IPAddress::IPv4Localhost(), 0));
+      if (rv != OK) {
+        udp_socket_.reset();
+        reply_ = kReplyGeneralFailure;
+      } else {
+        rv = udp_socket_->GetLocalAddress(&udp_bind_endpoint_);
+        if (rv != OK) {
+          udp_socket_.reset();
+          reply_ = kReplyGeneralFailure;
+        }
+      }
+    } else if (address_type_ == kEndPointDomain) {
       std::string domain(&buffer_[address_start], address_size_);
       request_endpoint_ = HostPortPair(domain, port_host);
     } else {
@@ -626,6 +660,18 @@ int Socks5ServerSocket::DoHandshakeWrite() {
         // clang-format on
     };
     buffer_ = std::string(write_data, std::size(write_data));
+    if (is_udp_associate_ && udp_socket_) {
+      const IPAddress& address = udp_bind_endpoint_.address();
+      if (address.IsIPv4()) {
+        const auto bytes = address.bytes();
+        buffer_[4] = static_cast<char>(bytes[0]);
+        buffer_[5] = static_cast<char>(bytes[1]);
+        buffer_[6] = static_cast<char>(bytes[2]);
+        buffer_[7] = static_cast<char>(bytes[3]);
+      }
+      uint16_t port_net = base::HostToNet16(udp_bind_endpoint_.port());
+      std::memcpy(&buffer_[8], &port_net, sizeof(port_net));
+    }
     bytes_sent_ = 0;
   }
 
