@@ -6,7 +6,9 @@
 #ifndef NET_TOOLS_NAIVE_NAIVE_CONNECTION_H_
 #define NET_TOOLS_NAIVE_NAIVE_CONNECTION_H_
 
+#include <cstddef>
 #include <memory>
+#include <queue>
 #include <string>
 
 #include "base/memory/scoped_refptr.h"
@@ -24,9 +26,11 @@ class ClientSocketHandle;
 class DrainableIOBuffer;
 class HttpNetworkSession;
 class IOBuffer;
+class IPEndPoint;
 class NetLogWithSource;
 class ProxyInfo;
 class StreamSocket;
+class UDPServerSocket;
 struct NetworkTrafficAnnotationTag;
 struct SSLConfig;
 class RedirectResolver;
@@ -88,6 +92,17 @@ class NaiveConnection {
   void OnPushError(Direction from, Direction to, int error);
   void OnPullComplete(Direction from, Direction to, int result);
   void OnPushComplete(Direction from, Direction to, int result);
+  int RunUdpAssociate(CompletionOnceCallback callback);
+  void StartUdpRecv();
+  void OnUdpRecvComplete(int result);
+  void OnUdpFrameWritten(int result);
+  void StartUotRead(size_t size);
+  void OnUotReadComplete(int result);
+  void ProcessUotReadBuffer();
+  void QueueServerWrite(std::string data);
+  void StartServerWrite();
+  void OnServerWriteComplete(int result);
+  void FinishRun(int result);
 
   std::optional<PaddingType> GetServerPaddingType() const;
 
@@ -112,6 +127,20 @@ class NaiveConnection {
   std::unique_ptr<NaivePaddingSocket> sockets_[kNumDirections];
   scoped_refptr<IOBuffer> read_buffers_[kNumDirections];
   scoped_refptr<DrainableIOBuffer> write_buffers_[kNumDirections];
+  std::unique_ptr<UDPServerSocket> udp_socket_;
+  scoped_refptr<IOBuffer> udp_read_buffer_;
+  scoped_refptr<IOBuffer> udp_send_buffer_;
+  std::unique_ptr<IPEndPoint> udp_recv_endpoint_;
+  std::unique_ptr<IPEndPoint> udp_client_endpoint_;
+  std::queue<std::string> server_write_queue_;
+  scoped_refptr<DrainableIOBuffer> server_write_buffer_;
+  std::string uot_read_buffer_;
+  std::string uot_frame_address_;
+  size_t uot_next_read_size_ = 0;
+  int uot_read_state_ = 0;
+  bool server_write_pending_ = false;
+  bool udp_send_pending_ = false;
+  bool udp_mode_ = false;
   int errors_[kNumDirections];
   bool write_pending_[kNumDirections];
   int bytes_passed_without_yielding_[kNumDirections];
