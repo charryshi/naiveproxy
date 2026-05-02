@@ -97,12 +97,12 @@ jobs:
           restore-keys: ccache-openwrt-${{ matrix.arch }}-${{ hashFiles('CHROMIUM_VERSION') }}-
       - name: Install APT packages
         run: |
-          sudo apt update
-          sudo apt install ninja-build pkg-config ccache bubblewrap
-          sudo apt remove -y qemu-user-binfmt
+          timeout 5m sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ninja-build pkg-config ccache bubblewrap
+          sudo apt-get remove -y qemu-user-binfmt
           sudo dpkg -i qemu-user*.deb
           # libc6-i386 interferes with x86 build
-          sudo apt remove libc6-i386
+          sudo apt-get remove -y libc6-i386
       - run: ./get-clang.sh
       - run: ccache -z
       - run: ./build.sh
